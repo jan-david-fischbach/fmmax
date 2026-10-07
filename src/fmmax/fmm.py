@@ -3,8 +3,9 @@
 Copyright (c) 2023 Meta Platforms, Inc. and affiliates.
 """
 
+import dataclasses
 import functools
-from typing import Callable, Optional, Tuple
+from typing import Callable, List, Optional, Sequence, Tuple
 
 import jax.numpy as jnp
 from jax import tree_util
@@ -32,6 +33,7 @@ def eigensolve_isotropic_media(
     permittivity: jnp.ndarray,
     expansion: basis.Expansion,
     formulation: Formulation | VectorFn = _DEFAULT_FORMULATION,
+    vector_field_source: Optional[jnp.ndarray] = None,
 ) -> "LayerSolveResult":
     """Performs the eigensolve for a layer with isotropic permittivity.
 
@@ -49,6 +51,14 @@ def eigensolve_isotropic_media(
         formulation: Specifies the formulation to be used, or a callable which computes
             the tangent vector field for a custom vector FMM formulation. The default
             is ``Formulation.JONES_DIRECT_FOURIER``.
+        vector_field_source: Optional array used to calculate the vector field for
+            vector formulations of the FMM, with shape ``(..., nx, ny)``. Its batch
+            dimensions need only be broadcast-compatible with those of
+            ``permittivity``: e.g. a single ``(nx, ny)`` array computes the vector
+            field once and reuses it for every element of a batch of permittivities
+            that share the same geometry (such as a dispersive material evaluated at
+            many wavelengths). If ``None``, the permittivity is used. Ignored for the
+            ``FFT`` formulation and for uniform layers.
 
     Returns:
         The ``LayerSolveResult``.
@@ -62,8 +72,21 @@ def eigensolve_isotropic_media(
     if permittivity.shape[-2:] == (1, 1):
         _eigensolve_fn = _eigensolve_uniform_isotropic_media
     else:
+        if vector_field_source is not None and (
+            vector_field_source.shape[-2:] != permittivity.shape[-2:]
+            or not misc.batch_compatible_shapes(
+                vector_field_source.shape[:-2], permittivity.shape[:-2]
+            )
+        ):
+            raise ValueError(
+                f"`vector_field_source` must have the spatial shape of `permittivity` "
+                f"and batch-compatible leading dimensions, but got shapes "
+                f"{vector_field_source.shape} and {permittivity.shape}."
+            )
         _eigensolve_fn = functools.partial(
-            _eigensolve_patterned_isotropic_media, formulation=formulation
+            _eigensolve_patterned_isotropic_media,
+            formulation=formulation,
+            vector_field_source=vector_field_source,
         )
 
     return _eigensolve_fn(
@@ -73,6 +96,110 @@ def eigensolve_isotropic_media(
         permittivity=permittivity,
         expansion=expansion,
     )
+
+
+def eigensolve_isotropic_media_layers(
+    wavelength: jnp.ndarray,
+    in_plane_wavevector: jnp.ndarray,
+    primitive_lattice_vectors: basis.LatticeVectors,
+    permittivities: Sequence[jnp.ndarray],
+    expansion: basis.Expansion,
+    formulation: Formulation | VectorFn = _DEFAULT_FORMULATION,
+    vector_field_sources: Optional[Sequence[jnp.ndarray]] = None,
+) -> List["LayerSolveResult"]:
+    """Performs the eigensolves for several isotropic layers in one batched call.
+
+    The layers are stacked along a new leading batch dimension, solved together and
+    returned as one ``LayerSolveResult`` per layer, each identical to the result of
+    ``eigensolve_isotropic_media`` for that layer. Solving the layers together
+    replaces one eigendecomposition call per layer with a single larger batched
+    call, which uses parallel hardware better when each layer contributes few
+    matrices (e.g. the slices of a staircased sloped sidewall).
+
+    Args:
+        wavelength: The free space wavelength of the excitation.
+        in_plane_wavevector: ``(kx0, ky0)``.
+        primitive_lattice_vectors: The primitive vectors for the real-space lattice.
+        permittivities: The permittivity arrays of the layers. All must have the same
+            shape ``(..., nx, ny)``.
+        expansion: The field expansion to be used.
+        formulation: Specifies the formulation to be used, or a callable which computes
+            the tangent vector field for a custom vector FMM formulation.
+        vector_field_sources: Optional arrays from which the vector fields are
+            computed, one per layer, all with the same shape (see
+            ``eigensolve_isotropic_media``).
+
+    Returns:
+        The list of ``LayerSolveResult``, in the order of ``permittivities``.
+    """
+    num_layers = len(permittivities)
+    if num_layers == 0:
+        return []
+    if not all(p.shape == permittivities[0].shape for p in permittivities):
+        raise ValueError(
+            f"All `permittivities` must have the same shape, but got shapes "
+            f"{[p.shape for p in permittivities]}."
+        )
+    if vector_field_sources is not None:
+        if len(vector_field_sources) != num_layers:
+            raise ValueError(
+                f"Expected one vector field source per layer ({num_layers}), but got "
+                f"{len(vector_field_sources)}."
+            )
+        if not all(v.shape == vector_field_sources[0].shape for v in vector_field_sources):
+            raise ValueError("All `vector_field_sources` must have the same shape.")
+
+    def lead(x: jnp.ndarray, n_trailing: int) -> jnp.ndarray:
+        # Insert the layer axis in front of the batch dimensions, aligned with the
+        # (possibly more) batch dimensions of the permittivity.
+        x = jnp.asarray(x)
+        num_batch = permittivities[0].ndim - 2
+        x = misc.atleast_nd(x, n=num_batch + n_trailing)
+        return x[jnp.newaxis]
+
+    result = eigensolve_isotropic_media(
+        wavelength=lead(wavelength, 0),
+        in_plane_wavevector=lead(in_plane_wavevector, 1),
+        primitive_lattice_vectors=basis.LatticeVectors(
+            u=lead(primitive_lattice_vectors.u, 1),
+            v=lead(primitive_lattice_vectors.v, 1),
+        ),
+        permittivity=jnp.stack(permittivities),
+        expansion=expansion,
+        formulation=formulation,
+        vector_field_source=(
+            None
+            if vector_field_sources is None
+            else jnp.stack(
+                [misc.atleast_nd(v, n=permittivities[0].ndim) for v in vector_field_sources]
+            )
+        ),
+    )
+    return [_layer_of(result, i, num_layers) for i in range(num_layers)]
+
+
+def _layer_of(
+    result: "LayerSolveResult", index: int, num_layers: int
+) -> "LayerSolveResult":
+    """Selects one layer from a result with a leading layer dimension."""
+
+    def take(x: Optional[jnp.ndarray]) -> Optional[jnp.ndarray]:
+        if x is None:
+            return None
+        return x[index] if x.shape[0] == num_layers else x[0]
+
+    updates = {}
+    for field in dataclasses.fields(result):
+        value = getattr(result, field.name)
+        if field.name == "expansion":
+            continue
+        if field.name == "primitive_lattice_vectors":
+            updates[field.name] = basis.LatticeVectors(u=take(value.u), v=take(value.v))
+        elif field.name == "tangent_vector_field":
+            updates[field.name] = None if value is None else (take(value[0]), take(value[1]))
+        else:
+            updates[field.name] = take(value)
+    return dataclasses.replace(result, **updates)
 
 
 def eigensolve_anisotropic_media(
@@ -384,6 +511,7 @@ def _eigensolve_patterned_isotropic_media(
     permittivity: jnp.ndarray,
     expansion: basis.Expansion,
     formulation: Formulation | VectorFn,
+    vector_field_source: Optional[jnp.ndarray] = None,
 ) -> LayerSolveResult:
     r"""Returns the results of a patterned isotropic layer eigensolve.
 
@@ -398,6 +526,8 @@ def _eigensolve_patterned_isotropic_media(
         expansion: The field expansion to be used.
         formulation: Specifies the formulation to be used, or a callable which computes
             the tangent vector field for a custom vector FMM formulation.
+        vector_field_source: Optional array from which the vector field is computed,
+            see ``eigensolve_isotropic_media``.
 
     Returns:
         The ``LayerSolveResult``.
@@ -420,6 +550,7 @@ def _eigensolve_patterned_isotropic_media(
         permittivity=permittivity,
         expansion=expansion,
         formulation=formulation,
+        vector_field_source=vector_field_source,
     )
 
     # Create permeability matrices for nonmagnetic materials.
@@ -753,11 +884,28 @@ def _numerical_eigensolve(
 # -----------------------------------------------------------------------------
 
 
+def _lattice_for(
+    source: jnp.ndarray, primitive_lattice_vectors: basis.LatticeVectors
+) -> basis.LatticeVectors:
+    """Lattice vectors trimmed of leading broadcast dimensions beyond ``source``."""
+    n = source.ndim - 2
+
+    def trim(x: jnp.ndarray) -> jnp.ndarray:
+        while x.ndim - 1 > n and x.shape[0] == 1:
+            x = x[0]
+        return x
+
+    return basis.LatticeVectors(
+        u=trim(primitive_lattice_vectors.u), v=trim(primitive_lattice_vectors.v)
+    )
+
+
 def _fourier_matrices_patterned_isotropic_media(
     primitive_lattice_vectors: basis.LatticeVectors,
     permittivity: jnp.ndarray,
     expansion: basis.Expansion,
     formulation: Formulation | VectorFn,
+    vector_field_source: Optional[jnp.ndarray] = None,
 ) -> Tuple[
     jnp.ndarray, jnp.ndarray, jnp.ndarray, Optional[Tuple[jnp.ndarray, jnp.ndarray]]
 ]:
@@ -773,6 +921,10 @@ def _fourier_matrices_patterned_isotropic_media(
         expansion: The field expansion to be used.
         formulation: Specifies the formulation to be used, or a callable which computes
             the tangent vector field for a custom vector FMM formulation.
+        vector_field_source: Optional array from which the vector field is computed,
+            with batch dimensions broadcast-compatible with ``permittivity``. The
+            field is computed on the source's own batch shape and then broadcast,
+            so a source without batch dimensions is processed only once.
 
     Returns:
         inverse_z_permittivity_matrix: The Fourier convolution matrix for the inverse
@@ -795,7 +947,15 @@ def _fourier_matrices_patterned_isotropic_media(
             vector_fn = vector.VECTOR_FIELD_SCHEMES[formulation.value]
         else:
             vector_fn = formulation
-        tx, ty = vector_fn(permittivity, expansion, primitive_lattice_vectors)
+        if vector_field_source is None:
+            tx, ty = vector_fn(permittivity, expansion, primitive_lattice_vectors)
+        else:
+            tx, ty = vector_fn(
+                vector_field_source, expansion, _lattice_for(vector_field_source, primitive_lattice_vectors)
+            )
+            batch_shape = jnp.broadcast_shapes(tx.shape[:-2], permittivity.shape[:-2])
+            tx = jnp.broadcast_to(tx, batch_shape + tx.shape[-2:])
+            ty = jnp.broadcast_to(ty, batch_shape + ty.shape[-2:])
         _transverse_permittivity_fn = functools.partial(
             fmm_matrices.transverse_permittivity_vector,
             tx=tx,
